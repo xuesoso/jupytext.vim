@@ -1,5 +1,7 @@
 # jupytext.vim
 
+* Silent output. Writing jupytext will not output annoying message to vim.
+
 [Vim][1]/[Neovim][2] plugin for editing [Jupyter notebook][3] (ipynb) files through [jupytext][4].
 
 https://www.vim.org/scripts/script.php?script_id=5764

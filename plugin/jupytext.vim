@@ -335,7 +335,7 @@ function s:write_to_ipynb() abort
     call s:debugmsg("Updating notebook from ".b:jupytext_file)
     let l:cmd = g:jupytext_command." --from=" . g:jupytext_fmt
     \         . " " . g:jupytext_to_ipynb_opts . " "
-    \         . shellescape(b:jupytext_file)
+    \         . shellescape(b:jupytext_file) . ">/dev/null" . " " . "2>&1"
     call s:debugmsg("cmd: ".l:cmd)
     let l:output=system(l:cmd)
     call s:debugmsg(l:output)
