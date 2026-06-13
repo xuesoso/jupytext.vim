@@ -90,6 +90,40 @@
 "       Command line options for the conversion from g:jupytext_fmt back to
 "       the notebook format
 "
+"    *  let g:jupytext_async = 1
+"
+"       Update the ipynb file in the background on save instead of blocking the
+"       editor until `jupytext` finishes. Your edits are written to the linked
+"       text file (notebook.md/.py) synchronously, and the ipynb is regenerated
+"       by a detached job; failures are reported via :messages. Set to 0 to
+"       force the original blocking behavior. Has no effect on Vim builds
+"       without job support, where the blocking path is always used. This is the
+"       fallback path used when the conversion daemon (below) is unavailable.
+"
+"    *  let g:jupytext_daemon = 1
+"
+"       Run conversions through a persistent helper process that imports
+"       jupytext once, instead of paying the ~0.2s Python/import startup on
+"       every open and save. With the daemon both opening and saving notebooks
+"       drop to a few milliseconds. If the daemon cannot be started (no usable
+"       Python, jupytext not importable, etc.) the plugin transparently falls
+"       back to invoking the `jupytext` command directly. Set to 0 to disable.
+"       The daemon currently requires Neovim; in classic Vim conversions use
+"       the `jupytext` CLI (asynchronously on save, see g:jupytext_async).
+"
+"    *  let g:jupytext_python = ''
+"
+"       The Python interpreter used to run the conversion daemon. It must be a
+"       Python in which `import jupytext` succeeds. When empty (the default),
+"       the interpreter is auto-detected from the `jupytext` executable's
+"       shebang, falling back to `python3`.
+"
+"    *  let g:jupytext_respect_metadata = 1
+"
+"       When a notebook records its own jupytext text format (e.g. it is paired
+"       to `py:percent`), open it in that format instead of g:jupytext_fmt.
+"       Requires the daemon. Set to 0 to always use g:jupytext_fmt.
+"
 "    *  let g:jupytext_filetype_map = {}
 "
 "       A mapping of g:jupytext_fmt to the filetype that should be used for
@@ -117,6 +151,10 @@
 if exists("loaded_jupytext") || &cp || exists("#BufReadCmd#*.ipynb")
     finish
 endif
+
+" Directory of this script, used to locate the bundled conversion daemon.
+let s:plugin_dir = expand('<sfile>:p:h')
+let s:server_py = s:plugin_dir . '/jupytext_server.py'
 
 
 " for all the formates that jupytext takes for --to, the filetype that vim
@@ -234,43 +272,405 @@ if !exists('g:jupytext_to_ipynb_opts')
     let g:jupytext_to_ipynb_opts = '--to=ipynb --update'
 endif
 
+if !exists('g:jupytext_async')
+    let g:jupytext_async = 1
+endif
+
+if !exists('g:jupytext_daemon')
+    let g:jupytext_daemon = 1
+endif
+
+if !exists('g:jupytext_python')
+    let g:jupytext_python = ''
+endif
+
+if !exists('g:jupytext_respect_metadata')
+    let g:jupytext_respect_metadata = 1
+endif
+
 if !g:jupytext_enable
     finish
 endif
+
+
+" State for in-flight background ipynb updates, keyed by buffer number. Each
+" value is a dict: {running, pending, cmd, temp, delete_temp, stderr, handle}.
+let s:jobs = {}
+
+" Whether this build can run the conversion as an asynchronous job.
+function s:can_async()
+    return has('nvim') ? exists('*jobstart') : exists('*job_start')
+endfunction
+
+
+" ===========================================================================
+" Conversion daemon: a persistent Python process (jupytext_server.py) that
+" imports jupytext once and converts on demand, so we avoid the ~0.2s import
+" cost on every open/save. Everything here degrades gracefully: if the daemon
+" cannot be started or a request fails at the transport level, callers fall
+" back to invoking the `jupytext` command directly.
+" ===========================================================================
+
+" status: 'none' (not started), 'ready' (usable), 'dead' (start failed, do not
+" retry this session). seq: request id counter. resp: id -> decoded response.
+" buf: stdout line-assembly buffer (Neovim). busy: re-entrancy guard.
+let s:daemon = {'status': 'none', 'seq': 0, 'resp': {}, 'buf': '', 'busy': 0}
+
+function s:daemon_supported()
+    if !g:jupytext_daemon || !filereadable(s:server_py)
+        return 0
+    endif
+    " The daemon is currently Neovim-only: it relies on a synchronous
+    " request/response over the job channel, which Neovim provides cleanly via
+    " on_stdout + vim.wait(). Classic Vim's channel semantics for this pattern
+    " are not yet verified here, so Vim falls back to the (asynchronous) jupytext
+    " CLI path, which is fully supported. The Vim branches below are kept so the
+    " daemon can be enabled for Vim once that path is validated on a real Vim.
+    if !has('nvim')
+        return 0
+    endif
+    return exists('*jobstart') && exists('*chansend')
+endfunction
+
+
+" Resolve the Python interpreter for the daemon: explicit override, else the
+" interpreter from the jupytext executable's shebang, else python3.
+function s:daemon_python()
+    if !empty(g:jupytext_python)
+        return g:jupytext_python
+    endif
+    let l:exe = exepath(g:jupytext_command)
+    if !empty(l:exe) && filereadable(l:exe)
+        let l:first = get(readfile(l:exe, '', 1), 0, '')
+        if l:first =~# '^#!'
+            let l:parts = split(l:first[2:])
+            if len(l:parts) >= 2 && fnamemodify(l:parts[0], ':t') ==# 'env'
+                return l:parts[1]
+            elseif len(l:parts) >= 1
+                return l:parts[0]
+            endif
+        endif
+    endif
+    return 'python3'
+endfunction
+
+
+" Neovim stdout handler: assemble lines and stash decoded responses by id.
+function s:daemon_on_stdout(id, data, event)
+    let s:daemon.buf .= join(a:data, "\n")
+    while stridx(s:daemon.buf, "\n") >= 0
+        let l:nl = stridx(s:daemon.buf, "\n")
+        let l:line = strpart(s:daemon.buf, 0, l:nl)
+        let s:daemon.buf = strpart(s:daemon.buf, l:nl + 1)
+        if l:line !=# ''
+            call s:daemon_store(l:line)
+        endif
+    endwhile
+endfunction
+
+function s:daemon_store(line)
+    try
+        let l:d = json_decode(a:line)
+    catch
+        return
+    endtry
+    if type(l:d) == type({}) && has_key(l:d, 'id') && l:d.id isnot v:null
+        let s:daemon.resp[l:d.id] = l:d
+    else
+        " Unsolicited handshake line ({ready:...} / {fatal:...}).
+        let s:daemon.handshake = l:d
+    endif
+endfunction
+
+
+function s:daemon_start()
+    let s:daemon.status = 'dead'
+    let l:py = s:daemon_python()
+    if !executable(l:py)
+        call s:debugmsg("daemon python not executable: ".l:py)
+        return 0
+    endif
+    let l:cmd = [l:py, s:server_py]
+    let s:daemon.resp = {}
+    let s:daemon.buf = ''
+    let s:daemon.seq = 0
+    if has('nvim')
+        let s:daemon.job = jobstart(l:cmd, {'on_stdout': function('s:daemon_on_stdout')})
+        if s:daemon.job <= 0
+            return 0
+        endif
+    else
+        let s:daemon.job = job_start(l:cmd,
+        \   {'mode': 'nl', 'in_io': 'pipe', 'out_io': 'pipe', 'err_io': 'null'})
+        if job_status(s:daemon.job) !=# 'run'
+            return 0
+        endif
+        let s:daemon.channel = job_getchannel(s:daemon.job)
+    endif
+    " Wait for the readiness handshake; a fatal line means jupytext is not
+    " importable in this interpreter, so the daemon is unusable.
+    let l:hs = s:daemon_read_handshake(5000)
+    if type(l:hs) != type({}) || !get(l:hs, 'ready', 0)
+        call s:debugmsg("daemon handshake failed: ".string(l:hs))
+        call s:daemon_stop()
+        let s:daemon.status = 'dead'
+        return 0
+    endif
+    let s:daemon.status = 'ready'
+    call s:debugmsg("daemon ready (".l:py.")")
+    return 1
+endfunction
+
+
+" Block until the unsolicited handshake line arrives (or timeout). Returns the
+" decoded handshake dict, or '' on timeout.
+function s:daemon_read_handshake(timeout)
+    if has('nvim')
+        call s:nvim_wait('JupytextDaemonReady', a:timeout)
+        return get(s:daemon, 'handshake', '')
+    else
+        let l:line = ch_read(s:daemon.channel, {'timeout': a:timeout})
+        if empty(l:line)
+            return ''
+        endif
+        call s:daemon_store(l:line)
+        return get(s:daemon, 'handshake', '')
+    endif
+endfunction
+
+
+" Neovim: pump the event loop (so on_stdout fires) until the named arg-free
+" poll function returns 1, or `timeout` ms elapse. Returns v:true/v:false.
+function s:nvim_wait(cond, timeout)
+    return luaeval('vim.wait(_A[1], function() return vim.fn[_A[2]]() == 1 end, 5)',
+    \              [a:timeout, a:cond])
+endfunction
+
+
+" Ensure the daemon is running; returns 1 if usable.
+function s:daemon_ensure()
+    if !s:daemon_supported()
+        return 0
+    endif
+    if s:daemon.status ==# 'ready'
+        " Verify the job is still alive; respawn if it died.
+        if s:daemon_alive()
+            return 1
+        endif
+        let s:daemon.status = 'none'
+    endif
+    if s:daemon.status ==# 'dead'
+        return 0
+    endif
+    return s:daemon_start()
+endfunction
+
+
+function s:daemon_alive()
+    if !has_key(s:daemon, 'job')
+        return 0
+    endif
+    if has('nvim')
+        return jobwait([s:daemon.job], 0)[0] == -1
+    endif
+    return job_status(s:daemon.job) ==# 'run'
+endfunction
+
+
+" Send a request and block for its response. Returns the decoded response dict,
+" or {'ok': 0, 'error': ...} on transport failure/timeout.
+function s:daemon_request(req) abort
+    if s:daemon.busy
+        " Re-entrant call (e.g. from an autocmd fired while pumping): don't
+        " interleave on the single pipe; let the caller fall back to the CLI.
+        return {'ok': 0, 'error': 'daemon busy'}
+    endif
+    if !s:daemon_ensure()
+        return {'ok': 0, 'error': 'daemon unavailable'}
+    endif
+    let s:daemon.seq += 1
+    let l:id = s:daemon.seq
+    let l:req = copy(a:req)
+    let l:req.id = l:id
+    let l:line = json_encode(l:req) . "\n"
+    let s:daemon.wait_id = l:id
+    let s:daemon.busy = 1
+    try
+        if has('nvim')
+            call chansend(s:daemon.job, l:line)
+            call s:nvim_wait('JupytextDaemonHasWaitId', 5000)
+        else
+            call ch_sendraw(s:daemon.channel, l:line)
+            " Responses arrive in order on a single synchronous channel.
+            let l:raw = ch_read(s:daemon.channel, {'timeout': 5000})
+            if !empty(l:raw)
+                call s:daemon_store(l:raw)
+            endif
+        endif
+    finally
+        let s:daemon.busy = 0
+    endtry
+    if has_key(s:daemon.resp, l:id)
+        let l:resp = remove(s:daemon.resp, l:id)
+        return l:resp
+    endif
+    " No response: treat the daemon as dead so we stop trying this session.
+    call s:debugmsg("daemon request timed out; disabling daemon")
+    call s:daemon_stop()
+    let s:daemon.status = 'dead'
+    return {'ok': 0, 'error': 'daemon timeout'}
+endfunction
+
+
+" Arg-free poll helpers called from s:nvim_wait() via vim.fn[...]. They are
+" global (vim.fn can only reach global functions) but read this script's
+" s:daemon state.
+function! JupytextDaemonReady()
+    return type(get(s:daemon, 'handshake', '')) == type({}) ? 1 : 0
+endfunction
+
+function! JupytextDaemonHasWaitId()
+    return has_key(s:daemon.resp, get(s:daemon, 'wait_id', -1)) ? 1 : 0
+endfunction
+
+
+function s:daemon_stop()
+    if has_key(s:daemon, 'job')
+        try
+            if has('nvim')
+                call jobstop(s:daemon.job)
+            else
+                call job_stop(s:daemon.job)
+            endif
+        catch
+        endtry
+        call remove(s:daemon, 'job')
+    endif
+    if has_key(s:daemon, 'channel')
+        call remove(s:daemon, 'channel')
+    endif
+endfunction
+
+
+" ===========================================================================
+" Conversion front-ends. Each tries the daemon first and falls back to the
+" `jupytext` CLI. They return a dict: {'ok': 0/1, 'error': '...'}.
+" ===========================================================================
+
+" Convert an ipynb file to its text representation (read path). Synchronous.
+function s:convert_to_text(ipynb, fmt, output) abort
+    let l:args = ['--to=' . a:fmt, '--output=' . a:output, a:ipynb]
+    if s:daemon_ensure()
+        let l:r = s:daemon_request({'op': 'to_text', 'args': l:args})
+        if get(l:r, 'ok', 0)
+            return {'ok': 1}
+        endif
+        " Only fall through to the CLI for daemon/transport errors; a genuine
+        " conversion error is reported as-is.
+        if has_key(l:r, 'error') && l:r.error !~# '^daemon '
+            return {'ok': 0, 'error': l:r.error}
+        endif
+    endif
+    return s:cli_convert(l:args)
+endfunction
+
+
+" Run a jupytext CLI conversion synchronously (fallback path).
+function s:cli_convert(args) abort
+    let l:cmd = g:jupytext_command . ' '
+    \         . join(map(copy(a:args), 'shellescape(v:val)')) . ' >/dev/null 2>&1'
+    let l:output = system(l:cmd)
+    if v:shell_error
+        return {'ok': 0, 'error': 'jupytext exited ' . v:shell_error}
+    endif
+    return {'ok': 1}
+endfunction
+
+
+" Detect a notebook's preferred text format from its metadata, or '' if none.
+function s:detect_fmt(ipynb) abort
+    if !g:jupytext_respect_metadata || !s:daemon_ensure()
+        return ''
+    endif
+    let l:r = s:daemon_request({'op': 'detect', 'input': a:ipynb})
+    if get(l:r, 'ok', 0) && get(l:r, 'fmt', v:null) isnot v:null
+        return l:r.fmt
+    endif
+    return ''
+endfunction
+
+
+" Is any conversion backend usable (daemon or the jupytext CLI)?
+function s:can_convert()
+    return s:daemon_ensure() || executable(g:jupytext_command)
+endfunction
+
+
+" Called when an ipynb cannot be converted on open. Rather than leaving an
+" empty, writable buffer (a later :w would overwrite the notebook), show the
+" raw notebook JSON read-only so it can be inspected/recovered safely. No
+" jupytext write/unload hooks are registered for this buffer.
+function s:read_failed(filename, msg) abort
+    echohl WarningMsg
+    echomsg "jupytext: " . a:msg . " - showing raw JSON read-only"
+    echohl None
+    if filereadable(a:filename)
+        silent execute "read ++enc=utf-8 " . fnameescape(a:filename)
+        silent 1delete _
+    endif
+    setlocal filetype=json
+    setlocal nomodified nomodifiable buftype=nowrite
+endfunction
 
 
 augroup jupytext_ipynb
     " Remove all ipynb autocommands
     au!
     autocmd BufReadCmd *.ipynb  call s:read_from_ipynb()
+    autocmd VimLeavePre *        call s:daemon_stop()
 augroup END
 
 
 function s:read_from_ipynb()
     au! jupytext_ipynb * <buffer>
     let l:filename = resolve(expand("<afile>:p"))
-    let l:fileroot = fnamemodify(l:filename, ':r')
-    if get(s:jupytext_extension_map, g:jupytext_fmt, 'none') == 'none'
-        echoerr "Invalid jupytext_fmt: ".g:jupytext_fmt
+    let l:filename_exists = filereadable(l:filename)
+
+    " Resolve the text format: honor the notebook's own jupytext metadata when
+    " enabled and present, otherwise use the global default.
+    let l:fmt = g:jupytext_fmt
+    if l:filename_exists
+        let l:detected = s:detect_fmt(l:filename)
+        if !empty(l:detected) && get(s:jupytext_extension_map, l:detected, 'none') != 'none'
+            call s:debugmsg("using notebook format from metadata: ".l:detected)
+            let l:fmt = l:detected
+        endif
+    endif
+    if get(s:jupytext_extension_map, l:fmt, 'none') == 'none'
+        echoerr "Invalid jupytext_fmt: ".l:fmt
         return
     endif
-    let b:jupytext_file = s:get_jupytext_file(l:filename, g:jupytext_fmt)
+    let b:jupytext_fmt = l:fmt
+    let b:jupytext_file = s:get_jupytext_file(l:filename, l:fmt)
     let b:jupytext_file_exists = filereadable(b:jupytext_file)
-    let l:filename_exists = filereadable(l:filename)
     call s:debugmsg("filename: ".l:filename)
     call s:debugmsg("filename exists: ".l:filename_exists)
     call s:debugmsg("jupytext_file: ".b:jupytext_file)
     call s:debugmsg("jupytext_file exists: ".b:jupytext_file_exists)
     if (l:filename_exists && !b:jupytext_file_exists)
+        " Make sure we have a working conversion backend BEFORE proceeding: if
+        " jupytext is missing we must not leave an empty, writable buffer that a
+        " later :w would write over the notebook (silent data loss).
+        if !s:can_convert()
+            call s:read_failed(l:filename, "jupytext not available ("
+            \   . g:jupytext_command . " not found and no usable daemon)")
+            return
+        endif
         call s:debugmsg("Generate file ".b:jupytext_file)
-        let l:cmd = g:jupytext_command." --to=".g:jupytext_fmt
-        \         . " --output=".shellescape(b:jupytext_file) . " "
-        \         . shellescape(l:filename)
-        call s:debugmsg("cmd: ".l:cmd)
-        let l:output=system(l:cmd)
-        call s:debugmsg(l:output)
-        if v:shell_error
-            echoerr l:cmd.": ".v:shell_error
+        let l:r = s:convert_to_text(l:filename, l:fmt, b:jupytext_file)
+        if !get(l:r, 'ok', 0)
+            call s:read_failed(l:filename,
+            \   "conversion failed: " . get(l:r, 'error', 'unknown error'))
             return
         endif
     endif
@@ -280,11 +680,8 @@ function s:read_from_ipynb()
         call s:debugmsg("read ".fnameescape(b:jupytext_file))
         silent execute "read ++enc=utf-8 ".fnameescape(b:jupytext_file)
     endif
-    if b:jupytext_file_exists
-        let l:register_unload_cmd = "autocmd jupytext_ipynb BufUnload <buffer> call s:cleanup(\"".fnameescape(b:jupytext_file)."\", 0)"
-    else
-        let l:register_unload_cmd = "autocmd jupytext_ipynb BufUnload <buffer> call s:cleanup(\"".fnameescape(b:jupytext_file)."\", 1)"
-    endif
+    let l:do_delete = b:jupytext_file_exists ? 0 : 1
+    let l:register_unload_cmd = "autocmd jupytext_ipynb BufUnload <buffer> call s:cleanup(\"".fnameescape(b:jupytext_file)."\", ".l:do_delete.", ".bufnr('%').")"
     call s:debugmsg(l:register_unload_cmd)
     silent execute l:register_unload_cmd
 
@@ -292,8 +689,8 @@ function s:read_from_ipynb()
     call s:debugmsg(l:register_write_cmd)
     silent execute l:register_write_cmd
 
-    let l:ft = get(g:jupytext_filetype_map, g:jupytext_fmt,
-    \              s:jupytext_filetype_map[g:jupytext_fmt])
+    let l:ft = get(g:jupytext_filetype_map, l:fmt,
+    \              s:jupytext_filetype_map[l:fmt])
     call s:debugmsg("filetype: ".l:ft)
     silent execute "setl fenc=utf-8 ft=".l:ft
     " In order to make :undo a no-op immediately after the buffer is read,
@@ -317,10 +714,6 @@ endfunction
 function s:get_jupytext_file(filename, fmt)
     " strip file extension
     let l:fileroot = fnamemodify(a:filename, ':r')
-    " the folder in which filename is
-    let l:head = fnamemodify(l:fileroot, ':h')
-    " the fileroot without the folder
-    let l:tail = fnamemodify(l:fileroot, ':t')
     " file extension from fmt
     let l:extension = s:jupytext_extension_map[a:fmt]
     let l:jupytext_file = l:fileroot . "." . l:extension
@@ -329,18 +722,57 @@ endfunction
 
 
 function s:write_to_ipynb() abort
-    let filename = resolve(expand("<afile>:p"))
     call s:debugmsg("overwriting ".fnameescape(b:jupytext_file))
+    " Persist the buffer to the linked text file (notebook.md/.py). This is a
+    " fast, local write and is the canonical record of the user's edits; the
+    " ipynb is a derived artifact regenerated from it below.
     silent execute "write! ".fnameescape(b:jupytext_file)
     call s:debugmsg("Updating notebook from ".b:jupytext_file)
-    let l:cmd = g:jupytext_command." --from=" . g:jupytext_fmt
-    \         . " " . g:jupytext_to_ipynb_opts . " "
-    \         . shellescape(b:jupytext_file) . ">/dev/null" . " " . "2>&1"
-    call s:debugmsg("cmd: ".l:cmd)
-    let l:output=system(l:cmd)
+    let l:fmt = get(b:, 'jupytext_fmt', g:jupytext_fmt)
+    " jupytext CLI argument vector, shared by the daemon and CLI paths.
+    let l:args = ["--from=".l:fmt] + split(g:jupytext_to_ipynb_opts) + [b:jupytext_file]
+    call s:debugmsg("args: ".join(l:args))
+
+    " Fast path: a synchronous daemon round-trip is only a few milliseconds, so
+    " no async juggling is needed when the daemon is up.
+    if s:daemon_ensure()
+        let l:r = s:daemon_request({'op': 'to_ipynb', 'args': l:args})
+        if get(l:r, 'ok', 0)
+            setlocal nomodified
+            return
+        endif
+        " A real conversion error (bad input, etc.) is final; only transport
+        " problems ('daemon ...') fall through to the CLI fallback below.
+        if has_key(l:r, 'error') && l:r.error !~# '^daemon '
+            echohl ErrorMsg
+            echomsg "jupytext: update failed: " . l:r.error
+            echohl None
+            return
+        endif
+    endif
+
+    " Fallback: the jupytext CLI, async if the build supports it.
+    let l:cmd = [g:jupytext_command] + l:args
+    if g:jupytext_async && s:can_async()
+        call s:start_update(bufnr('%'), l:cmd, b:jupytext_file)
+        " The edits are safely saved in the linked file, so clear 'modified'
+        " now: the editor stays responsive and :wq works. The ipynb is
+        " regenerated in the background and errors are surfaced from the job's
+        " exit callback (see s:on_job_done).
+        setlocal nomodified
+    else
+        call s:sync_update(l:cmd)
+    endif
+endfunction
+
+
+" Original blocking conversion, used when async is disabled or unavailable.
+function s:sync_update(cmd) abort
+    let l:shellcmd = join(map(copy(a:cmd), 'shellescape(v:val)')) . " >/dev/null 2>&1"
+    let l:output = system(l:shellcmd)
     call s:debugmsg(l:output)
     if v:shell_error
-        echoerr l:cmd.": ".v:shell_error
+        echoerr "jupytext: conversion to ipynb failed (".v:shell_error.")"
     else
         setlocal nomodified
         echo expand("%") . " saved via jupytext."
@@ -348,12 +780,127 @@ function s:write_to_ipynb() abort
 endfunction
 
 
-function s:cleanup(jupytext_file, delete)
-    call s:debugmsg("a:jupytext_file:".a:jupytext_file)
-    if a:delete
-        call s:debugmsg("deleting ".fnameescape(a:jupytext_file))
-        call delete(expand(fnameescape(a:jupytext_file)))
+" Launch (or queue) a background ipynb update for the given buffer.
+function s:start_update(bufnr, cmd, temp) abort
+    if !has_key(s:jobs, a:bufnr)
+        let s:jobs[a:bufnr] = {'running': 0, 'pending': 0, 'delete_temp': 0}
     endif
+    let l:j = s:jobs[a:bufnr]
+    let l:j.cmd = a:cmd
+    let l:j.temp = a:temp
+    if l:j.running
+        " A conversion is already running; collapse this and any further rapid
+        " saves into a single re-run once the current job finishes. The linked
+        " file already holds the latest content, so the re-run picks it up.
+        let l:j.pending = 1
+        call s:debugmsg("update already running; queued re-run")
+        return
+    endif
+    call s:launch_job(a:bufnr)
+endfunction
+
+
+function s:launch_job(bufnr) abort
+    let l:j = s:jobs[a:bufnr]
+    let l:j.running = 1
+    let l:j.pending = 0
+    let l:j.stderr = []
+    " 'detach'/'stoponexit' let the conversion outlive a :wq so the ipynb is
+    " never left stale, while the exit callback still fires for in-session
+    " saves to report errors and run deferred cleanup.
+    if has('nvim')
+        let l:handle = jobstart(l:j.cmd, {
+        \   'detach': v:true,
+        \   'on_exit': function('s:on_job_done', [a:bufnr]),
+        \ })
+        if l:handle <= 0
+            call s:debugmsg("jobstart failed; falling back to blocking update")
+            let l:j.running = 0
+            call remove(s:jobs, a:bufnr)
+            call s:sync_update(l:j.cmd)
+            return
+        endif
+    else
+        let l:handle = job_start(l:j.cmd, {
+        \   'stoponexit': '',
+        \   'in_io': 'null',
+        \   'out_io': 'null',
+        \   'err_cb': function('s:on_job_stderr', [a:bufnr]),
+        \   'exit_cb': function('s:on_job_done', [a:bufnr]),
+        \ })
+        if job_status(l:handle) ==# 'fail'
+            call s:debugmsg("job_start failed; falling back to blocking update")
+            let l:j.running = 0
+            call remove(s:jobs, a:bufnr)
+            call s:sync_update(l:j.cmd)
+            return
+        endif
+    endif
+    let l:j.handle = l:handle
+endfunction
+
+
+" Vim-only: accumulate stderr so failures can report a reason.
+function s:on_job_stderr(bufnr, channel, msg) abort
+    if has_key(s:jobs, a:bufnr)
+        call add(s:jobs[a:bufnr].stderr, a:msg)
+    endif
+endfunction
+
+
+" exit_cb(job, status) in Vim; on_exit(id, code, event) in Neovim. The buffer
+" number is bound, so the exit code is the second extra argument.
+function s:on_job_done(bufnr, ...) abort
+    let l:code = a:0 >= 2 ? a:2 : 0
+    if !has_key(s:jobs, a:bufnr)
+        return
+    endif
+    let l:j = s:jobs[a:bufnr]
+    let l:j.running = 0
+    if l:code != 0
+        " The ipynb on disk is now stale. Re-flag the buffer as modified so the
+        " user is nudged to save again, report the failure, and keep the linked
+        " file around (don't run any deferred delete).
+        if bufexists(a:bufnr)
+            call setbufvar(a:bufnr, '&modified', 1)
+        endif
+        let l:detail = empty(get(l:j, 'stderr', [])) ? '' : ': '.join(l:j.stderr, ' ')
+        echohl ErrorMsg
+        echomsg "jupytext: background update of "
+        \     . fnamemodify(bufname(a:bufnr), ':t')." failed (".l:code.")".l:detail
+        echohl None
+        let l:j.delete_temp = 0
+    endif
+    if get(l:j, 'pending', 0)
+        " A save came in while we were busy: re-run with the latest content.
+        call s:launch_job(a:bufnr)
+        return
+    endif
+    if get(l:j, 'delete_temp', 0)
+        " The buffer was unloaded mid-update; finish the deferred cleanup now.
+        call s:debugmsg("deferred delete of ".l:j.temp)
+        call delete(expand(fnameescape(l:j.temp)))
+    endif
+    call remove(s:jobs, a:bufnr)
+endfunction
+
+
+function s:cleanup(jupytext_file, delete, bufnr)
+    call s:debugmsg("a:jupytext_file:".a:jupytext_file)
+    if !a:delete
+        return
+    endif
+    " A background update may still be reading the linked file; defer the delete
+    " until the job finishes (s:on_job_done) so we never pull the file out from
+    " under jupytext mid-conversion.
+    if has_key(s:jobs, a:bufnr)
+    \  && (s:jobs[a:bufnr].running || s:jobs[a:bufnr].pending)
+        call s:debugmsg("update in flight; deferring delete of ".a:jupytext_file)
+        let s:jobs[a:bufnr].delete_temp = 1
+        return
+    endif
+    call s:debugmsg("deleting ".fnameescape(a:jupytext_file))
+    call delete(expand(fnameescape(a:jupytext_file)))
 endfunction
 
 
