@@ -1,6 +1,6 @@
 # jupytext.vim Release Notes
 
-## Unreleased
+## 0.2.0 (2026-06-13)
 
 * Conversion daemon (Neovim): conversions can run through a persistent helper
   process that imports `jupytext` once, turning the ~0.2s Python/import startup
