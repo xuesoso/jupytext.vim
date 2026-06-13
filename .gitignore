@@ -1,2 +1,18 @@
 data/
 work/
+
+# Python intermediate / bytecode artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test artifacts
+.pytest_cache/
+.cache/
+*.results
+
+# Editor / OS cruft
+*.swp
+*.swo
+*~
+.DS_Store

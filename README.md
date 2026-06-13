@@ -32,8 +32,9 @@ notebook size. This fork removes that latency from the editing loop.
 * **🚀 Persistent conversion daemon** — `g:jupytext_daemon` (on by default,
   **Neovim only**). A helper process imports `jupytext` once and converts on
   demand, turning the per-call ~0.2s startup into a one-time cost. Opening and
-  saving notebooks drop to a few milliseconds. If no suitable Python is found
-  it transparently falls back to the `jupytext` CLI, so correctness never
+  saving notebooks drop to a few milliseconds. If no suitable Python is found —
+  or if `g:jupytext_command` is set to something other than `jupytext` (e.g.
+  `notedown`) — it transparently falls back to the CLI, so correctness never
   depends on it. In classic Vim, conversions use the CLI (asynchronously on
   save, per above).
 
@@ -51,8 +52,10 @@ notebook size. This fork removes that latency from the editing loop.
 * **🤫 Silent on success, loud on failure** — successful background saves stay
   quiet; only real conversion errors surface (via `:messages`).
 
-* **🧹 Internals** — subprocess calls use argument lists (no shell-quoting
-  pitfalls), plus assorted dead-code cleanup.
+* **🧹 Internals** — the async path uses argument lists, and the CLI fallback
+  shell-escapes its arguments and uses the platform's null device (so a command
+  path with spaces and Windows `cmd.exe` both work); plus assorted dead-code
+  cleanup and unit/integration tests under `test/`.
 
 All new behavior is controlled by the settings in
 [Configuration](#configuration); set any of the new options to `0` to get the
@@ -170,13 +173,21 @@ Override any of the defaults below by setting the corresponding variable in your
     the daemon, opening and saving drop to a few milliseconds. If the daemon
     cannot start (no usable Python, `jupytext` not importable, etc.) the plugin
     transparently falls back to the `jupytext` CLI, so correctness never depends
-    on it. Set to `0` to disable. In classic Vim the CLI path is always used.
+    on it. The daemon is only used when `g:jupytext_command` resolves to
+    `jupytext`; with any other command (e.g. `notedown`) the CLI path is used.
+    Set to `0` to disable. In classic Vim the CLI path is always used.
 
 *   `let g:jupytext_python = ''` *(new)*
 
     The Python interpreter used to run the daemon. It must be one where
     `import jupytext` succeeds. When empty (default), it is auto-detected from
     the `jupytext` executable's shebang, falling back to `python3`.
+
+*   `let g:jupytext_daemon_timeout = 5000` *(new)*
+
+    Maximum time in milliseconds to wait for the conversion daemon handshake
+    or a single conversion request. Increase this if the daemon times out on
+    slow systems, conda environments, or very large notebooks.
 
 *   `let g:jupytext_respect_metadata = 1` *(new)*
 
@@ -187,8 +198,10 @@ Override any of the defaults below by setting the corresponding variable in your
 *   `let g:jupytext_filetype_map = {}`
 
     A mapping of `g:jupytext_fmt` to the buffer filetype (`:help filetype`),
-    which determines syntax highlighting. Use it to override the default
-    filetype, e.g. to use `pandoc` instead of `markdown` for the `md` format:
+    which determines syntax highlighting. User-provided entries are merged with
+    the plugin's built-in defaults, so you only need to specify the formats you
+    want to override, e.g. to use `pandoc` instead of `markdown` for the `md`
+    format:
 
         let g:jupytext_filetype_map = {'md': 'pandoc'}
 
@@ -207,6 +220,9 @@ To use this plugin as a replacement for the [`ipynb_notedown.vim` plugin][5] via
     let g:jupytext_command = 'notedown'
     let g:jupytext_fmt = 'markdown'
     let g:jupytext_to_ipynb_opts = '--to=notebook'
+
+Conversions then go through the `notedown` CLI; the `jupytext`-specific daemon
+and notebook-format auto-detection (`g:jupytext_respect_metadata`) do not apply.
 
 
 ## Credits

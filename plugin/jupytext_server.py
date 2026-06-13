@@ -17,9 +17,6 @@ Protocol (one JSON object per line, request -> response):
     -> {"id": 3, "op": "detect",   "input": "nb.ipynb"}
     <- {"id": 3, "ok": true, "fmt": "py:percent"}   # or "fmt": null when unpaired
 
-    -> {"id": 4, "op": "ping"}
-    <- {"id": 4, "ok": true}
-
 On startup the server emits one unsolicited handshake line:
 
     <- {"id": null, "ready": true, "ok": true}          # jupytext imported fine
@@ -43,18 +40,68 @@ def _write(obj):
     sys.stdout.flush()
 
 
+def _find_notebook_metadata(text):
+    """Return the notebook's top-level ``metadata`` object, or None.
+
+    A full ``json.load`` of a large notebook builds Python objects for every
+    cell and output (base64 images, long result arrays) -- the dominant cost on
+    open, paid only to read a tiny ``metadata`` block. Instead, locate each
+    ``"metadata"`` key with the C-level ``str.find`` and decode only the small
+    object that follows it, returning the one that carries notebook-level
+    metadata (it has a ``jupytext``/``kernelspec``/``language_info`` entry; a
+    cell's metadata does not). Falls back to a full parse for unusual layouts.
+
+    Decoy ``"metadata":`` text inside a cell output cannot cause a false match:
+    such a decode either fails or yields a dict lacking the marker keys, so it
+    is ignored.
+    """
+    decoder = json.JSONDecoder()
+    needle = '"metadata"'
+    nlen = len(needle)
+    n = len(text)
+    best = None
+    pos = text.find(needle)
+    while pos != -1:
+        j = pos + nlen
+        while j < n and text[j] in " \t\r\n":
+            j += 1
+        if j < n and text[j] == ":":
+            j += 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            try:
+                val, _ = decoder.raw_decode(text, j)
+            except ValueError:
+                val = None
+            if isinstance(val, dict):
+                if "jupytext" in val:
+                    return val  # definitive: this is the notebook metadata
+                if best is None and ("kernelspec" in val or "language_info" in val):
+                    best = val
+        pos = text.find(needle, pos + nlen)
+    if best is not None:
+        return best
+    # Fallback: a full parse handles notebooks whose top-level metadata carries
+    # none of the marker keys, or an unusual key layout.
+    try:
+        obj = json.loads(text)
+    except Exception:
+        return None
+    return obj.get("metadata") if isinstance(obj, dict) else None
+
+
 def _detect_fmt(path):
     """Return the text format a notebook is paired/configured for, or None.
 
-    Uses a plain JSON read (no jupytext needed) to inspect metadata.jupytext so
-    it stays cheap even for large notebooks.
+    Reads metadata.jupytext (no jupytext import needed). See
+    _find_notebook_metadata for how this stays cheap on large notebooks.
     """
     try:
         with open(path, encoding="utf-8") as f:
-            nb = json.load(f)
+            text = f.read()
     except Exception:
         return None
-    jt = (nb.get("metadata") or {}).get("jupytext") or {}
+    jt = (_find_notebook_metadata(text) or {}).get("jupytext") or {}
     formats = jt.get("formats")
     if isinstance(formats, str):
         for part in formats.split(","):
@@ -72,14 +119,23 @@ def _detect_fmt(path):
 
 
 def _run_cli(jcli, args):
-    """Invoke jupytext's CLI in-process, capturing any stray output."""
+    """Invoke jupytext's CLI in-process, capturing any stray output.
+
+    jupytext's entry point signals failure two ways: it may raise SystemExit
+    (e.g. argparse errors) or simply *return* a non-zero exit code. We must
+    honor both -- a handled error that only returns non-zero would otherwise be
+    reported to the client as success and the stale ipynb treated as saved.
+    """
     buf = io.StringIO()
     code = 0
     with redirect_stdout(buf), redirect_stderr(buf):
         try:
-            jcli(args)
+            code = jcli(args) or 0
         except SystemExit as exc:  # the CLI exits on both success and error
             code = exc.code or 0
+    # Normalize a non-int code (e.g. SystemExit with a string message) to 1.
+    if not isinstance(code, int):
+        code = 1
     return code, buf.getvalue()
 
 
@@ -116,9 +172,7 @@ def main():
         op = req.get("op")
         resp = {"id": rid, "ok": False}
         try:
-            if op == "ping":
-                resp["ok"] = True
-            elif op == "detect":
+            if op == "detect":
                 resp["ok"] = True
                 resp["fmt"] = _detect_fmt(req.get("input", ""))
             elif op in ("to_text", "to_ipynb"):

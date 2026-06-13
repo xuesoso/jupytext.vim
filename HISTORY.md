@@ -26,6 +26,37 @@
   so the notebook is never left stale. Falls back to the original blocking
   behavior when set to `0` or on Vim builds without job support. This is the
   path used in classic Vim and whenever the daemon is unavailable.
+* Hardened invalid-format handling: an unknown or unsupported `g:jupytext_fmt`
+  now falls back to raw JSON read-only instead of leaving an empty, writable
+  buffer that could overwrite the notebook.
+* CLI fallback now captures `jupytext` stderr so conversion failures report a
+  useful message instead of only an exit code; Neovim async jobs also capture
+  stderr.
+* Daemon interpreter detection now handles `#!/usr/bin/env -S python3` shebangs.
+* `g:jupytext_filetype_map` is merged with the built-in defaults; users no
+  longer need to copy the entire map to override one format.
+* Added `g:jupytext_daemon_timeout` (default 5000 ms) for slow systems or large
+  notebooks.
+* The daemon is now used only when `g:jupytext_command` actually resolves to
+  `jupytext`. Previously a custom command such as `notedown` would be silently
+  bypassed and the in-process `jupytext` library used instead, producing the
+  wrong conversion; such commands now correctly use the CLI path.
+* The daemon helper now reports a conversion failure when `jupytext`'s entry
+  point *returns* a non-zero exit code (not only when it raises), so handled
+  errors are no longer reported as a successful save.
+* A respawned daemon no longer treats a previous process's readiness handshake
+  as its own, which could mark a not-yet-ready process as usable.
+* Neovim background-save failures now capture stderr correctly (the previous
+  handler used Vim's `err_cb` calling convention, which mismatched Neovim's
+  `on_stderr` argument shape).
+* CLI fallback no longer hard-codes the POSIX `/dev/null`; it uses `NUL` on
+  Windows so the synchronous/CLI conversion paths work under `cmd.exe`.
+* The `jupytext` command is now shell-escaped in the CLI fallback, so a command
+  configured with a path containing spaces works.
+* Notebook-format detection no longer parses the entire notebook on open; it
+  scans for the top-level `metadata` block and decodes only that, which is
+  markedly faster for large notebooks with many/large cell outputs.
+* Removed the unused `ping` daemon op.
 
 ## 0.1.2 (2019-11-10)
 
